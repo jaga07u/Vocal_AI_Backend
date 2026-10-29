@@ -262,4 +262,9 @@ def get_vocab_cache_status(
         "cached": False,
         "vocabulary": []
     }
+@app.get("/health")
+def health():
+    return {
+        "status":"ok",
+    }
 

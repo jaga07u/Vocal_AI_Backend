@@ -7,6 +7,7 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 from youtube_transcript_api import (
+    CouldNotRetrieveTranscript,
     YouTubeTranscriptApi,
     TranscriptsDisabled,
     NoTranscriptFound,
@@ -52,36 +53,87 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 # Cache results so we don't call Gemini repeatedly for the same video
 cache = {}
 
-def get_video_transcript(video_id: str):
+def get_video_transcript(video_id: str, YouTubeRequestFailed):
+    """
+    Fetches transcript for a YouTube video:
+    1. Direct English (manual or auto-generated: en, en-US, en-GB, en-IN, etc.)
+    2. Any language translated to English
+    Returns list of dicts: [{'text': str, 'start': float, 'duration': float}] or None.
+    """
     try:
-        api = YouTubeTranscriptApi()
-        transcript_list = api.list(video_id)
+        # Compatible with both v1.x (instance) and older (class method) APIs
+        try:
+            api = YouTubeTranscriptApi()
+            transcript_list = api.list(video_id)
+        except (AttributeError, TypeError):
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
 
-        # Prefer English transcripts, including auto-generated ones.
+        raw_data = None
+
+        # 1. Look for standard English language codes
         try:
             transcript = transcript_list.find_transcript([
-                "en", "en-US", "en-GB", "en-IN"
+                "en", "en-US", "en-GB", "en-IN", "en-CA", "en-AU"
             ])
-            return transcript.fetch()
-
-        except NoTranscriptFound:
+            raw_data = transcript.fetch()
+        except Exception:
             pass
 
-        # Try translating another available transcript into English.
-        for transcript in transcript_list:
-            if transcript.is_translatable:
-                return transcript.translate("en").fetch()
+        # 2. Look for ANY transcript whose code starts with 'en' (e.g. en-IE, en-ZA)
+        if not raw_data:
+            for t in transcript_list:
+                if t.language_code.lower().startswith("en"):
+                    try:
+                        raw_data = t.fetch()
+                        break
+                    except Exception:
+                        continue
 
-        return None
+        # 3. Fallback: Translate any available foreign language track into English
+        if not raw_data:
+            for t in transcript_list:
+                if getattr(t, "is_translatable", False):
+                    try:
+                        raw_data = t.translate("en").fetch()
+                        break
+                    except Exception:
+                        continue
+
+        if not raw_data:
+            print(f"[Transcript] No usable English transcript found for: {video_id}")
+            return None
+
+        # 4. Standardize output into list of dicts with float timestamps
+        formatted_transcript = []
+        for item in raw_data:
+            # Handles both dicts and FetchedTranscriptSnippet objects
+            text = item["text"] if isinstance(item, dict) else getattr(item, "text", "")
+            start = item["start"] if isinstance(item, dict) else getattr(item, "start", 0.0)
+            duration = item["duration"] if isinstance(item, dict) else getattr(item, "duration", 0.0)
+
+            # Clean newlines and HTML artifacts from the subtitle text
+            clean_text = " ".join(text.replace("\n", " ").split())
+            if clean_text:
+                formatted_transcript.append({
+                    "text": clean_text,
+                    "start": round(float(start), 2),
+                    "duration": round(float(duration), 2)
+                })
+
+        return formatted_transcript if formatted_transcript else None
 
     except (TranscriptsDisabled, NoTranscriptFound) as e:
-        print(f"Transcript unavailable: {e}")
+        print(f"[Transcript] Subtitles unavailable for {video_id}: {e}")
+        return None
+
+    except (CouldNotRetrieveTranscript, YouTubeRequestFailed) as e:
+        # Typically raised when YouTube blocks datacenter/cloud IPs
+        print(f"[Transcript IP Block/Network Error] for {video_id}: {e}")
         return None
 
     except Exception as e:
-        print(f"Transcript fetching error: {type(e).__name__}: {e}")
+        print(f"[Transcript Unknown Error] {type(e).__name__} for {video_id}: {e}")
         return None
-    
 def analyze_with_gemini(transcript_chunk: list, target_level: str):
     """
     Sends timestamped lines to Gemini to extract CEFR-level vocabulary.

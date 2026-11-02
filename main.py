@@ -1,322 +1,397 @@
-import os
 import json
-from fastapi import FastAPI, HTTPException, Query
+import logging
+import os
+from typing import Any
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-# from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
-from youtube_transcript_api import (
-    CouldNotRetrieveTranscript,
-    YouTubeTranscriptApi,
-    TranscriptsDisabled,
-    NoTranscriptFound,
-)
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
+from youtube_transcript_api import (
+    CouldNotRetrieveTranscript,
+    NoTranscriptFound,
+    TranscriptsDisabled,
+    YouTubeTranscriptApi,
+)
 
-
+# -----------------------------------------------------------------------------
+# Configuration and logging
+# -----------------------------------------------------------------------------
 load_dotenv()
 
-app = FastAPI(title="Vocab AI Backend")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("vocab_ai")
+
 MONGODB_URI = os.getenv("MONGODB_URI")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 if not MONGODB_URI:
-    raise RuntimeError("MONGODB_URI is missing from .env")
+    raise RuntimeError("MONGODB_URI is missing from environment variables")
 
-mongo_client = MongoClient(
-    MONGODB_URI,
-    serverSelectionTimeoutMS=5000
-)
-mongo_client.admin.command("ping")
-print("MongoDB connected!")
-db = mongo_client["vocab_ai"]
-vocab_collection = db["vocabulary"]
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is missing from environment variables")
 
-# One cached document per video + level
-vocab_collection.create_index(
-    [("video_id", 1), ("level", 1)],
-    unique=True
-)
-# Allow extension to communicate with localhost
+# -----------------------------------------------------------------------------
+# FastAPI application
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Vocab AI Backend")
+
+# The extension's MV3 service worker uses host_permissions for API access.
+# CORS is retained for possible web clients. Do not combine wildcard origins
+# with credentials.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# Initialize Gemini Client
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
-# Cache results so we don't call Gemini repeatedly for the same video
-cache = {}
-
-def get_video_transcript(video_id: str, YouTubeRequestFailed):
-    """
-    Fetches transcript for a YouTube video:
-    1. Direct English (manual or auto-generated: en, en-US, en-GB, en-IN, etc.)
-    2. Any language translated to English
-    Returns list of dicts: [{'text': str, 'start': float, 'duration': float}] or None.
-    """
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info("Incoming request: %s %s", request.method, request.url.path)
     try:
-        # Compatible with both v1.x (instance) and older (class method) APIs
-        try:
-            api = YouTubeTranscriptApi()
-            transcript_list = api.list(video_id)
-        except (AttributeError, TypeError):
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        response = await call_next(request)
+        logger.info(
+            "Completed request: %s %s -> %s",
+            request.method,
+            request.url.path,
+            response.status_code,
+        )
+        return response
+    except Exception:
+        logger.exception("Unhandled error while processing %s", request.url.path)
+        raise
 
+# -----------------------------------------------------------------------------
+# MongoDB
+# -----------------------------------------------------------------------------
+try:
+    mongo_client = MongoClient(
+        MONGODB_URI,
+        serverSelectionTimeoutMS=5000,
+    )
+    mongo_client.admin.command("ping")
+    logger.info("MongoDB connected")
+
+    db = mongo_client["vocab_ai"]
+    vocab_collection = db["vocabulary"]
+    vocab_collection.create_index(
+        [("video_id", 1), ("level", 1)],
+        unique=True,
+    )
+except PyMongoError:
+    logger.exception("Could not connect to MongoDB")
+    raise
+
+# -----------------------------------------------------------------------------
+# Gemini
+# -----------------------------------------------------------------------------
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# -----------------------------------------------------------------------------
+# YouTube transcript retrieval
+# -----------------------------------------------------------------------------
+def get_video_transcript(video_id: str) -> list[dict[str, Any]] | None:
+    """Return transcript entries as dictionaries with text/start/duration."""
+    try:
+        # Current youtube-transcript-api usage (v1.x).
+        transcript_list = YouTubeTranscriptApi().list(video_id)
         raw_data = None
 
-        # 1. Look for standard English language codes
+        # Prefer English tracks.
         try:
-            transcript = transcript_list.find_transcript([
-                "en", "en-US", "en-GB", "en-IN", "en-CA", "en-AU"
-            ])
+            transcript = transcript_list.find_transcript(
+                ["en", "en-US", "en-GB", "en-IN", "en-CA", "en-AU"]
+            )
             raw_data = transcript.fetch()
-        except Exception:
-            pass
+        except (NoTranscriptFound, TranscriptsDisabled):
+            raw_data = None
+        except Exception as exc:
+            logger.info("Could not select preferred English transcript: %s", exc)
+            raw_data = None
 
-        # 2. Look for ANY transcript whose code starts with 'en' (e.g. en-IE, en-ZA)
+        # Try any other English language code.
         if not raw_data:
-            for t in transcript_list:
-                if t.language_code.lower().startswith("en"):
+            for transcript in transcript_list:
+                language_code = getattr(transcript, "language_code", "") or ""
+                if language_code.lower().startswith("en"):
                     try:
-                        raw_data = t.fetch()
+                        raw_data = transcript.fetch()
                         break
-                    except Exception:
-                        continue
+                    except Exception as exc:
+                        logger.info("Could not fetch %s transcript: %s", language_code, exc)
 
-        # 3. Fallback: Translate any available foreign language track into English
+        # If no English track exists, try translating another available track.
         if not raw_data:
-            for t in transcript_list:
-                if getattr(t, "is_translatable", False):
+            for transcript in transcript_list:
+                if getattr(transcript, "is_translatable", False):
                     try:
-                        raw_data = t.translate("en").fetch()
+                        raw_data = transcript.translate("en").fetch()
                         break
-                    except Exception:
-                        continue
+                    except Exception as exc:
+                        logger.info("Transcript translation failed: %s", exc)
 
         if not raw_data:
-            print(f"[Transcript] No usable English transcript found for: {video_id}")
+            logger.warning("No usable transcript found for video %s", video_id)
             return None
 
-        # 4. Standardize output into list of dicts with float timestamps
-        formatted_transcript = []
-        for item in raw_data:
-            # Handles both dicts and FetchedTranscriptSnippet objects
-            text = item["text"] if isinstance(item, dict) else getattr(item, "text", "")
-            start = item["start"] if isinstance(item, dict) else getattr(item, "start", 0.0)
-            duration = item["duration"] if isinstance(item, dict) else getattr(item, "duration", 0.0)
+        formatted_transcript: list[dict[str, Any]] = []
 
-            # Clean newlines and HTML artifacts from the subtitle text
-            clean_text = " ".join(text.replace("\n", " ").split())
-            if clean_text:
-                formatted_transcript.append({
+        for item in raw_data:
+            # FetchedTranscriptSnippet objects expose attributes in v1.x.
+            if isinstance(item, dict):
+                text = item.get("text", "")
+                start = item.get("start", 0.0)
+                duration = item.get("duration", 0.0)
+            else:
+                text = getattr(item, "text", "")
+                start = getattr(item, "start", 0.0)
+                duration = getattr(item, "duration", 0.0)
+
+            clean_text = " ".join(str(text).replace("\n", " ").split())
+            if not clean_text:
+                continue
+
+            formatted_transcript.append(
+                {
                     "text": clean_text,
                     "start": round(float(start), 2),
-                    "duration": round(float(duration), 2)
-                })
+                    "duration": round(float(duration), 2),
+                }
+            )
 
-        return formatted_transcript if formatted_transcript else None
+        return formatted_transcript or None
 
-    except (TranscriptsDisabled, NoTranscriptFound) as e:
-        print(f"[Transcript] Subtitles unavailable for {video_id}: {e}")
+    except (TranscriptsDisabled, NoTranscriptFound) as exc:
+        logger.warning("Subtitles unavailable for %s: %s", video_id, exc)
+        return None
+    except CouldNotRetrieveTranscript as exc:
+        logger.warning("Could not retrieve transcript for %s: %s", video_id, exc)
+        return None
+    except Exception:
+        logger.exception("Unexpected transcript error for video %s", video_id)
         return None
 
-    except (CouldNotRetrieveTranscript, YouTubeRequestFailed) as e:
-        # Typically raised when YouTube blocks datacenter/cloud IPs
-        print(f"[Transcript IP Block/Network Error] for {video_id}: {e}")
-        return None
-
-    except Exception as e:
-        print(f"[Transcript Unknown Error] {type(e).__name__} for {video_id}: {e}")
-        return None
-def analyze_with_gemini(transcript_chunk: list, target_level: str):
-    """
-    Sends timestamped lines to Gemini to extract CEFR-level vocabulary.
-    """
-    # Keep only start time and text to save tokens
+# -----------------------------------------------------------------------------
+# Gemini vocabulary analysis
+# -----------------------------------------------------------------------------
+def analyze_with_gemini(
+    transcript_chunk: list[dict[str, Any]],
+    target_level: str,
+) -> list[dict[str, Any]]:
+    """Extract CEFR vocabulary and return a validated list of word objects."""
     formatted_transcript = [
-    {
-        "start": round(entry.start, 1),
-        "text": entry.text
-    }
-    for entry in transcript_chunk
-]
+        {
+            "start": round(float(entry["start"]), 1),
+            "text": entry["text"],
+        }
+        for entry in transcript_chunk
+    ]
 
     prompt = f"""
-    You are an expert language teacher.
-    Analyze the timestamped transcript below.
-    Extract key vocabulary words that are at or around or above CEFR level '{target_level}' (e.g., B2, C1).
-    
-    Transcript:
-    {json.dumps(formatted_transcript)} 
+You are an expert English language teacher.
+Analyze the timestamped transcript below.
+Extract useful vocabulary at, around, or above CEFR level {target_level}.
 
-    Rules:
-    1. Select only meaningful words (ignore basic conversational words like 'the', 'however', 'because').
-    2. 'timestamp' MUST strictly match the 'start' second when that word appears in the transcript.
-    3. Keep definitions short (under 10 words) and contextual to what is being spoken.
-    4. Provide 'duration' in seconds for how long the popup card should stay (between 3.0 and 5.0).
+Transcript:
+{json.dumps(formatted_transcript, ensure_ascii=False)}
 
-    Output STRICTLY a JSON list of objects matching this format:
-    [
-      {{
-        "word": "eloquent",
-        "cefr": "C1",
-        "definition": "fluent or persuasive in speaking or writing",
-        "timestamp": 14.2,
-        "duration": 4.0
-      }}
-    ]
-    """
+Rules:
+1. Select meaningful vocabulary; ignore basic words such as 'the', 'and', and 'because'.
+2. The timestamp must match the start time of the transcript segment where the word appears.
+3. Keep each definition under 10 words and relevant to the context.
+4. Set duration between 3.0 and 5.0 seconds.
+5. Return only words that actually appear in the transcript.
+
+Return strictly a JSON array in this format:
+[
+  {{
+    "word": "eloquent",
+    "cefr": "C1",
+    "definition": "fluent or persuasive in speaking or writing",
+    "timestamp": 14.2,
+    "duration": 4.0
+  }}
+]
+"""
 
     try:
-        # We request application/json output directly from Gemini
         response = client.models.generate_content(
-            model="gemini-3.8-flash",
+            model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.2,
             ),
         )
-        print("Gemini response:", response.text)
+
+        if not response.text:
+            raise ValueError("Gemini returned an empty response")
+
         vocab_data = json.loads(response.text)
-        print("Parsed vocabulary:", vocab_data)
-        
-        # In case the model returns {"words": [...]} instead of [...]
+
+        # Support either a JSON array or an object containing the array.
         if isinstance(vocab_data, dict):
-            for key in ["words", "vocabulary", "data"]:
-                if key in vocab_data:
-                    return vocab_data[key]
-            return []
-            
-        return vocab_data
+            for key in ("words", "vocabulary", "data"):
+                if isinstance(vocab_data.get(key), list):
+                    vocab_data = vocab_data[key]
+                    break
+            else:
+                raise ValueError("Gemini JSON did not contain a vocabulary array")
 
-    except Exception as e:
-     print("Gemini analysis error:", type(e).__name__, str(e))
-    return []
+        if not isinstance(vocab_data, list):
+            raise ValueError("Gemini response must be a JSON array")
 
+        # Validate and normalize fields before storing/returning them.
+        validated_words = []
+        for item in vocab_data:
+            if not isinstance(item, dict):
+                continue
 
-@app.get("/api/vocab")
-def get_vocab(
-    video_id: str = Query(..., description="YouTube Video ID"),
-    level: str = Query("B2")
+            word = item.get("word")
+            definition = item.get("definition")
+            timestamp = item.get("timestamp")
+            duration = item.get("duration", 4.0)
+
+            if not isinstance(word, str) or not word.strip():
+                continue
+            if not isinstance(definition, str) or not definition.strip():
+                continue
+
+            try:
+                timestamp = float(timestamp)
+                duration = float(duration)
+            except (TypeError, ValueError):
+                continue
+
+            if timestamp < 0:
+                continue
+
+            duration = min(max(duration, 3.0), 5.0)
+
+            validated_words.append(
+                {
+                    "word": word.strip(),
+                    "cefr": str(item.get("cefr", target_level)).upper(),
+                    "definition": definition.strip(),
+                    "timestamp": timestamp,
+                    "duration": duration,
+                }
+            )
+
+        logger.info("Gemini generated %d vocabulary items", len(validated_words))
+        return validated_words
+
+    except Exception as exc:
+        logger.exception("Gemini vocabulary analysis failed: %s", exc)
+        raise
+
+# -----------------------------------------------------------------------------
+# API endpoints
+# -----------------------------------------------------------------------------
+@app.get("/")
+def home():
+    return {"message": "Vocab AI Backend is running"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/api/vocab/cache-status")
+def get_vocab_cache_status(
+    video_id: str = Query(..., min_length=1),
+    level: str = Query("B2"),
 ):
     level = level.upper()
 
-    # 1. Check MongoDB first
     try:
         cached_doc = vocab_collection.find_one(
-            {
-                "video_id": video_id,
-                "level": level
-            },
-            {"_id": 0, "vocabulary": 1}
+            {"video_id": video_id, "level": level},
+            {"_id": 0, "vocabulary": 1},
         )
-    except PyMongoError as e:
-        print("MongoDB read error:", repr(e))
+    except PyMongoError as exc:
+        logger.exception("MongoDB cache-status read failed")
         raise HTTPException(
             status_code=503,
-            detail="Vocabulary database is unavailable."
-        )
+            detail="Vocabulary database is unavailable.",
+        ) from exc
 
-    # 2. If found, return immediately
     if cached_doc is not None:
-        print(f"MongoDB cache HIT: {video_id}, {level}")
-        return cached_doc["vocabulary"]
+        logger.info("MongoDB cache HIT: %s, %s", video_id, level)
+        return {
+            "cached": True,
+            "vocabulary": cached_doc.get("vocabulary", []),
+        }
 
-    print(f"MongoDB cache MISS: {video_id}, {level}")
+    logger.info("MongoDB cache MISS: %s, %s", video_id, level)
+    return {"cached": False, "vocabulary": []}
 
-    # 3. Fetch YouTube transcript
+@app.get("/api/vocab")
+def get_vocab(
+    video_id: str = Query(..., min_length=1),
+    level: str = Query("B2"),
+):
+    level = level.upper()
+
+    try:
+        cached_doc = vocab_collection.find_one(
+            {"video_id": video_id, "level": level},
+            {"_id": 0, "vocabulary": 1},
+        )
+    except PyMongoError as exc:
+        logger.exception("MongoDB vocabulary read failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Vocabulary database is unavailable.",
+        ) from exc
+
+    if cached_doc is not None:
+        logger.info("MongoDB cache HIT: %s, %s", video_id, level)
+        return cached_doc.get("vocabulary", [])
+
+    logger.info("MongoDB cache MISS: %s, %s", video_id, level)
+
     transcript = get_video_transcript(video_id)
-
     if not transcript:
         raise HTTPException(
             status_code=404,
-            detail="No usable transcript found for this video."
+            detail="No usable transcript found for this video. YouTube may not provide accessible captions.",
         )
 
-    # 4. Generate vocabulary using Gemini
-    vocab_list = analyze_with_gemini(transcript, level)
+    try:
+        vocab_list = analyze_with_gemini(transcript, level)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Vocabulary generation failed: {type(exc).__name__}",
+        ) from exc
 
     if not vocab_list:
         raise HTTPException(
             status_code=502,
-            detail="Vocabulary generation failed or returned no words."
+            detail="Gemini returned no usable vocabulary words.",
         )
 
-    # 5. Save results in MongoDB
     try:
         vocab_collection.update_one(
-            {
-                "video_id": video_id,
-                "level": level
-            },
+            {"video_id": video_id, "level": level},
             {
                 "$set": {
                     "video_id": video_id,
                     "level": level,
-                    "vocabulary": vocab_list
+                    "vocabulary": vocab_list,
                 }
             },
-            upsert=True
+            upsert=True,
         )
+        logger.info("MongoDB cache SAVED: %s, %s", video_id, level)
+    except PyMongoError:
+        # Return generated vocabulary even if saving the cache fails.
+        logger.exception("MongoDB cache save failed for %s", video_id)
 
-        print(f"MongoDB cache SAVED: {video_id}, {level}")
-
-    except PyMongoError as e:
-        # Gemini succeeded, so still return the generated result
-        print("MongoDB save error:", repr(e))
-
-    # 6. Return the newly generated result
     return vocab_list
-
-@app.get("/api/vocab/cache-status")
-def get_vocab_cache_status(
-    video_id: str = Query(..., description="YouTube Video ID"),
-    level: str = Query("B2")
-):
-    level = level.upper()
-
-    try:
-        cached_doc = vocab_collection.find_one(
-            {
-                "video_id": video_id,
-                "level": level
-            },
-            {
-                "_id": 0,
-                "vocabulary": 1
-            }
-        )
-    except PyMongoError as e:
-        print("MongoDB cache-status read error:", repr(e))
-        raise HTTPException(
-            status_code=503,
-            detail="Vocabulary database is unavailable."
-        )
-
-    if cached_doc is not None:
-        print(f"MongoDB cache HIT: {video_id}, {level}")
-
-        return {
-            "cached": True,
-            "vocabulary": cached_doc.get("vocabulary", [])
-        }
-
-    print(f"MongoDB cache MISS: {video_id}, {level}")
-
-    return {
-        "cached": False,
-        "vocabulary": []
-    }
-@app.get("/health")
-def health():
-    return {
-        "status":"ok",
-    }
-

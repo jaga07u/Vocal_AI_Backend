@@ -32,12 +32,6 @@ print("MongoDB connected!")
 db = mongo_client["vocab_ai"]
 vocab_collection = db["vocabulary"]
 
-UNIVERSAL_FALLBACK = [
-    {"word": "Phenomenon", "cefr": "B2", "definition": "A remarkable or exceptional person or thing.", "timestamp": 8.0, "duration": 4.0},
-    {"word": "Substantial", "cefr": "B2", "definition": "Of considerable importance, size, or worth.", "timestamp": 18.0, "duration": 4.0},
-    {"word": "Comprehensive", "cefr": "C1", "definition": "Including or dealing with all or nearly all elements.", "timestamp": 30.0, "duration": 4.0},
-    {"word": "Perspective", "cefr": "B2", "definition": "A particular attitude toward or way of regarding something.", "timestamp": 45.0, "duration": 4.0}
-]
 # One cached document per video + level
 vocab_collection.create_index(
     [("video_id", 1), ("level", 1)],
@@ -185,49 +179,49 @@ def get_vocab(
 
     print(f"MongoDB cache MISS: {video_id}, {level}")
 
-    # # 3. Fetch YouTube transcript
-    # transcript = get_video_transcript(video_id)
+    # 3. Fetch YouTube transcript
+    transcript = get_video_transcript(video_id)
 
-    # if not transcript:
-    #     raise HTTPException(
-    #         status_code=404,
-    #         detail="No usable transcript found for this video."
-    #     )
+    if not transcript:
+        raise HTTPException(
+            status_code=404,
+            detail="No usable transcript found for this video."
+        )
 
-    # # 4. Generate vocabulary using Gemini
-    # vocab_list = analyze_with_gemini(transcript, level)
+    # 4. Generate vocabulary using Gemini
+    vocab_list = analyze_with_gemini(transcript, level)
 
-    # if not vocab_list:
-    #     raise HTTPException(
-    #         status_code=502,
-    #         detail="Vocabulary generation failed or returned no words."
-    #     )
+    if not vocab_list:
+        raise HTTPException(
+            status_code=502,
+            detail="Vocabulary generation failed or returned no words."
+        )
 
-    # # 5. Save results in MongoDB
-    # try:
-    #     vocab_collection.update_one(
-    #         {
-    #             "video_id": video_id,
-    #             "level": level
-    #         },
-    #         {
-    #             "$set": {
-    #                 "video_id": video_id,
-    #                 "level": level,
-    #                 "vocabulary": vocab_list
-    #             }
-    #         },
-    #         upsert=True
-    #     )
+    # 5. Save results in MongoDB
+    try:
+        vocab_collection.update_one(
+            {
+                "video_id": video_id,
+                "level": level
+            },
+            {
+                "$set": {
+                    "video_id": video_id,
+                    "level": level,
+                    "vocabulary": vocab_list
+                }
+            },
+            upsert=True
+        )
 
-    #     print(f"MongoDB cache SAVED: {video_id}, {level}")
+        print(f"MongoDB cache SAVED: {video_id}, {level}")
 
-    # except PyMongoError as e:
-    #     # Gemini succeeded, so still return the generated result
-    #     print("MongoDB save error:", repr(e))
+    except PyMongoError as e:
+        # Gemini succeeded, so still return the generated result
+        print("MongoDB save error:", repr(e))
 
-    # # 6. Return the newly generated result
-    return UNIVERSAL_FALLBACK
+    # 6. Return the newly generated result
+    return vocab_list
 
 @app.get("/api/vocab/cache-status")
 def get_vocab_cache_status(

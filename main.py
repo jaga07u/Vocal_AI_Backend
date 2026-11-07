@@ -27,7 +27,7 @@ logger = logging.getLogger("vocab_ai")
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 if not MONGODB_URI:
     raise RuntimeError("MONGODB_URI is missing from environment variables")

@@ -11,6 +11,7 @@ from google.genai import types
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from youtube_transcript_api.proxies import WebshareProxyConfig
+from fastapi.middleware.cors import CORSMiddleware
 # -----------------------------------------------------------------------------
 # Configuration and logging
 # -----------------------------------------------------------------------------
@@ -36,7 +37,17 @@ if not GEMINI_API_KEY:
 # FastAPI application
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Vocab AI Backend")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://www.youtube.com",
+        "https://youtube.com",
+        "chrome://extensions/"
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"]
+)
 # The extension's MV3 service worker uses host_permissions for API access.
 # CORS is retained for possible web clients. Do not combine wildcard origins
 # with credentials.

@@ -39,25 +39,14 @@ if not GEMINI_API_KEY:
 app = FastAPI(title="Vocab AI Backend")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://www.youtube.com",
-        "https://youtube.com",
-        "chrome://extensions/"
-    ],
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"]
+    allow_headers=["*"]
 )
 # The extension's MV3 service worker uses host_permissions for API access.
 # CORS is retained for possible web clients. Do not combine wildcard origins
 # with credentials.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "OPTIONS"],
-    allow_headers=["*"],
-)
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):

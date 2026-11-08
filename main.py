@@ -96,87 +96,27 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # -----------------------------------------------------------------------------
 # YouTube transcript retrieval
 # -----------------------------------------------------------------------------
-def get_video_transcript(video_id: str) -> list[dict[str, Any]] | None:
-    """Return transcript entries as dictionaries with text/start/duration."""
+def get_video_transcript(video_id: str):
     try:
-        # Current youtube-transcript-api usage (v1.x).
-        transcript_list = YouTubeTranscriptApi().list(video_id)
-        raw_data = None
+        ytt_api = YouTubeTranscriptApi()
 
-        # Prefer English tracks.
-        try:
-            transcript = transcript_list.find_transcript(
-                ["en", "en-US", "en-GB", "en-IN", "en-CA", "en-AU"]
-            )
-            raw_data = transcript.fetch()
-        except (NoTranscriptFound, TranscriptsDisabled):
-            raw_data = None
-        except Exception as exc:
-            logger.info("Could not select preferred English transcript: %s", exc)
-            raw_data = None
+        # Fetch English transcript only
+        transcript = ytt_api.fetch(video_id)
 
-        # Try any other English language code.
-        if not raw_data:
-            for transcript in transcript_list:
-                language_code = getattr(transcript, "language_code", "") or ""
-                if language_code.lower().startswith("en"):
-                    try:
-                        raw_data = transcript.fetch()
-                        break
-                    except Exception as exc:
-                        logger.info("Could not fetch %s transcript: %s", language_code, exc)
+        captions = [
+            {
+                "text": snippet.text,
+                "start": snippet.start,
+                "duration": snippet.duration
+            }
+            for snippet in transcript
+        ]
 
-        # If no English track exists, try translating another available track.
-        if not raw_data:
-            for transcript in transcript_list:
-                if getattr(transcript, "is_translatable", False):
-                    try:
-                        raw_data = transcript.translate("en").fetch()
-                        break
-                    except Exception as exc:
-                        logger.info("Transcript translation failed: %s", exc)
+        return captions or None
 
-        if not raw_data:
-            logger.warning("No usable transcript found for video %s", video_id)
-            return None
-
-        formatted_transcript: list[dict[str, Any]] = []
-
-        for item in raw_data:
-            # FetchedTranscriptSnippet objects expose attributes in v1.x.
-            if isinstance(item, dict):
-                text = item.get("text", "")
-                start = item.get("start", 0.0)
-                duration = item.get("duration", 0.0)
-            else:
-                text = getattr(item, "text", "")
-                start = getattr(item, "start", 0.0)
-                duration = getattr(item, "duration", 0.0)
-
-            clean_text = " ".join(str(text).replace("\n", " ").split())
-            if not clean_text:
-                continue
-
-            formatted_transcript.append(
-                {
-                    "text": clean_text,
-                    "start": round(float(start), 2),
-                    "duration": round(float(duration), 2),
-                }
-            )
-
-        return formatted_transcript or None
-
-    except (TranscriptsDisabled, NoTranscriptFound) as exc:
-        logger.warning("Subtitles unavailable for %s: %s", video_id, exc)
+    except Exception as exc:
+        logger.exception("English transcript fetch failed: %s", exc)
         return None
-    except CouldNotRetrieveTranscript as exc:
-        logger.warning("Could not retrieve transcript for %s: %s", video_id, exc)
-        return None
-    except Exception:
-        logger.exception("Unexpected transcript error for video %s", video_id)
-        return None
-
 # -----------------------------------------------------------------------------
 # Gemini vocabulary analysis
 # -----------------------------------------------------------------------------

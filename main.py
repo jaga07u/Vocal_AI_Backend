@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from typing import Any
-
+import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,13 +10,7 @@ from google import genai
 from google.genai import types
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
-from youtube_transcript_api import (
-    CouldNotRetrieveTranscript,
-    NoTranscriptFound,
-    TranscriptsDisabled,
-    YouTubeTranscriptApi,
-)
-
+from youtube_transcript_api.proxies import WebshareProxyConfig
 # -----------------------------------------------------------------------------
 # Configuration and logging
 # -----------------------------------------------------------------------------
@@ -28,6 +22,9 @@ logger = logging.getLogger("vocab_ai")
 MONGODB_URI = os.getenv("MONGODB_URI")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+PROXY_USERNAME=os.getenv("PROXY_USERNAME")
+PROXY_PASSWORD=os.getenv("PROXY_PASSWORD")
+API_KEY = os.getenv("YOUTUBE_TRANSCRIPT_API_KEY")
 
 if not MONGODB_URI:
     raise RuntimeError("MONGODB_URI is missing from environment variables")
@@ -98,24 +95,36 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # -----------------------------------------------------------------------------
 def get_video_transcript(video_id: str):
     try:
-        ytt_api = YouTubeTranscriptApi()
+        response = requests.post(
+            "https://www.youtube-transcript.io/api/transcripts",
+            headers={
+                "Authorization": f"Basic {API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={"ids": [video_id]},
+            timeout=60
+        )
 
-        # Fetch English transcript only
-        transcript = ytt_api.fetch(video_id)
+        response.raise_for_status()
+
+        data = response.json()
+
+        transcript = data[0]["tracks"][0]["transcript"]
 
         captions = [
             {
-                "text": snippet.text,
-                "start": snippet.start,
-                "duration": snippet.duration
+                "text": snippet["text"].strip(),
+                "start": float(snippet["start"]),
+                "duration": float(snippet["dur"])
             }
             for snippet in transcript
+            if snippet.get("text", "").strip()
         ]
 
         return captions or None
 
     except Exception as exc:
-        logger.exception("English transcript fetch failed: %s", exc)
+        logger.exception("Transcript fetch failed: %s", exc)
         return None
 # -----------------------------------------------------------------------------
 # Gemini vocabulary analysis
